@@ -54,10 +54,29 @@ def _check() -> int:
     lv = algorithms.louvain(g)
     assert lv["num_communities"] >= 2, lv  # cliques should separate
 
+    # -- hierarchical communities --------------------------------------
+    # Per-community modularity contributions must sum to the reported Q.
+    assign = {int(n): int(c) for n, c in lv["communities"].items()}
+    contribs, total_q = algorithms.modularity_breakdown(g, assign)
+    assert abs(total_q - lv["modularity"]) < 1e-9, (total_q, lv["modularity"])
+    assert abs(sum(contribs.values()) - lv["modularity"]) < 1e-9
+
+    # The induced subgraph keeps exactly the community's members, and a
+    # second-level Louvain partitions precisely that membership.
+    members = [n for n, c in assign.items() if c == 0]
+    sub = algorithms.induced_subgraph(g, members)
+    assert set(sub.nodes) == set(members), (sub.nodes, members)
+    sub_lv = algorithms.louvain(sub)
+    sub_assign = {int(n) for n in sub_lv["communities"]}
+    assert sub_assign == set(members), (sub_assign, members)
+    sub_contribs, sub_q = algorithms.modularity_breakdown(sub, {int(n): int(c) for n, c in sub_lv["communities"].items()})
+    assert abs(sub_q - sub_lv["modularity"]) < 1e-9
+    assert sub_lv["num_communities"] >= 1
+
     rec = algorithms.hybrid_recommend(g, 1, k=3)
     assert "items" in rec
 
-    print("[check] OK: graph, bfs, pagerank, louvain, recommend all pass")
+    print("[check] OK: graph, bfs, pagerank, louvain, sub-louvain, recommend all pass")
     return 0
 
 

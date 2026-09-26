@@ -25,6 +25,9 @@ Endpoint summary (all under ``/api``):
     GET    /api/common-friends        ?source&target
     GET    /api/community             (cached)
     POST   /api/community/compute     {resolution?}
+    GET    /api/community/hierarchy   大社群层（规模 + 模块度贡献 + 细分状态）
+    GET    /api/community/sub         ?community=<id>  某社群的二级细分（缓存）
+    POST   /api/community/sub/compute {community, resolution?, force?}
     GET    /api/pagerank              ?top&refresh
     GET    /api/recommend/<id>        ?k&refresh&strategy
     POST   /api/recommend             {ids:[...], k}
@@ -281,6 +284,32 @@ class ApiRouter:
             resolution = _to_float((body or {}).get("resolution"), config.LOUVAIN_RESOLUTION)
             force = _to_bool(str((body or {}).get("force", "true")))
             return 200, self.service.compute_community(resolution=resolution, force=True)
+
+        # --- hierarchical (second-level) communities ---
+        if route == "/community/hierarchy" and method == "GET":
+            return 200, self.service.community_hierarchy()
+        if route == "/community/sub" and method == "GET":
+            comm_id = _to_int(query.get("community"), -1)
+            if comm_id < 0:
+                return _error("缺少 community 参数")
+            view = self.service.subcommunity_view(comm_id)
+            if view is None:
+                return _error(f"社群 {comm_id} 不存在", 404)
+            return 200, view
+        if route == "/community/sub/compute" and method == "POST":
+            b = body or {}
+            comm_id = _to_int(str(b.get("community", -1)), -1)
+            if comm_id < 0:
+                return _error("缺少 community 参数")
+            resolution = _to_float(str(b.get("resolution", "")), config.LOUVAIN_RESOLUTION)
+            force = _to_bool(str(b.get("force", "false")))
+            try:
+                entry = self.service.compute_subcommunity(
+                    comm_id, resolution=resolution, force=force
+                )
+            except ValueError as exc:
+                return _error(str(exc), 400)
+            return 200, entry
 
         # --- pagerank ---
         if route == "/pagerank" and method == "GET":

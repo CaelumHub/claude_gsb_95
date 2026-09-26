@@ -436,6 +436,24 @@ class DerivedStore:
     def save_community(self, community: dict) -> None:
         config.atomic_write_json(config.COMMUNITY_FILE, community)
 
+    def load_subcommunity(self) -> dict:
+        """Second-level (intra-community) Louvain results.
+
+        Stored apart from ``community.json`` so the global partition and its
+        colouring are never touched by a sub-division.  Shape::
+
+            {"version": 1, "sub": {"<community_id>": {<entry>}}}
+        """
+        data = config.read_json(config.SUBCOMMUNITY_FILE, {})
+        if not isinstance(data, dict):
+            return {"version": 1, "sub": {}}
+        data.setdefault("version", 1)
+        data.setdefault("sub", {})
+        return data
+
+    def save_subcommunity(self, sub: dict) -> None:
+        config.atomic_write_json(config.SUBCOMMUNITY_FILE, sub)
+
     def load_pagerank(self) -> dict:
         return config.read_json(config.PAGERANK_FILE, {})
 

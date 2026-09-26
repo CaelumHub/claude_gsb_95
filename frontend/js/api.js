@@ -80,6 +80,10 @@
     // 社群 / PageRank
     community: () => request("GET", "/api/community"),
     computeCommunity: (resolution) => request("POST", "/api/community/compute", { resolution }),
+    communityHierarchy: () => request("GET", "/api/community/hierarchy"),
+    subcommunity: (community) => request("GET", "/api/community/sub" + qs({ community })),
+    computeSubcommunity: (community, resolution, force) =>
+      request("POST", "/api/community/sub/compute", { community, resolution, force }),
     pagerank: (p) => request("GET", "/api/pagerank" + qs(p)),
 
     // 推荐

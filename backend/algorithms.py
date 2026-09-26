@@ -20,7 +20,7 @@ import heapq
 import math
 import random
 from collections import Counter, defaultdict, deque
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     from . import config
@@ -447,6 +447,76 @@ def louvain(
         "iterations": iterations,
         "num_communities": len(ordered),
     }
+
+
+# ===========================================================================
+# Hierarchical (second-level) community detection
+# ===========================================================================
+def induced_subgraph(graph: Graph, nodes: Iterable[int]) -> Graph:
+    """Build the induced subgraph on ``nodes``.
+
+    Every edge of ``graph`` with both endpoints in ``nodes`` is kept (with its
+    original weight); member nodes are always present, even if they end up
+    isolated inside the subset, so a sub-partition always covers exactly the
+    requested membership.  The returned graph is frozen and reuses the
+    original node ids, which keeps sub-community assignments directly
+    comparable with the global partition.
+    """
+    node_set = set(nodes)
+    sub = Graph(directed=False)
+    for nid in node_set:
+        sub.add_node(nid)
+    for nid in node_set:
+        for nb, w in graph.neighbors_with_weights(nid):
+            # Undirected adjacency stores each edge twice; keep it once.
+            if nb in node_set and nid < nb:
+                sub.add_edge(nid, nb, w)
+    sub.freeze()
+    return sub
+
+
+def modularity_breakdown(
+    graph: Graph,
+    communities: Dict[int, int],
+) -> Tuple[Dict[int, float], float]:
+    """Per-community modularity contributions plus the total modularity.
+
+    Uses exactly the same convention as :func:`louvain`'s internal
+    ``_compute_modularity`` -- ``Q = Σ_c [in_c / m2 − (deg_c / m2)²]`` where
+    ``m2`` is twice the total edge weight and ``in_c`` counts each internal
+    edge once -- so the returned contributions sum to the modularity that
+    Louvain reports.  This lets the UI show a meaningful "modularity" number
+    for *each* community at *each* level of the hierarchy, not just a single
+    global score.
+
+    ``communities`` maps node id -> community id (both plain ints).
+    """
+    if not communities:
+        return {}, 0.0
+
+    m2 = 0.0
+    degree: Dict[int, float] = defaultdict(float)
+    internal2: Dict[int, float] = defaultdict(float)  # internal weight x2
+    for nid, comm in communities.items():
+        if not graph.has_node(nid):
+            continue
+        for nb, w in graph.neighbors_with_weights(nid):
+            m2 += w
+            degree[comm] += w
+            if communities.get(nb) == comm:
+                internal2[comm] += w
+
+    if m2 == 0:
+        return {c: 0.0 for c in degree}, 0.0
+
+    inv_m2 = 1.0 / m2
+    contributions: Dict[int, float] = {}
+    total = 0.0
+    for comm, deg in degree.items():
+        q = (internal2[comm] / 2.0) * inv_m2 - (deg * inv_m2) ** 2
+        contributions[comm] = q
+        total += q
+    return contributions, total
 
 
 # ===========================================================================

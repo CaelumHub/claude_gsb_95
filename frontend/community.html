@@ -15,7 +15,7 @@
         <div class="page-head">
           <div>
             <h1>社群发现</h1>
-            <p class="desc">Louvain 两阶段模块度优化：局部移动 + 图聚合，迭代至收敛。结果用于全图着色。</p>
+            <p class="desc">Louvain 两阶段模块度优化：局部移动 + 图聚合，迭代至收敛。结果用于全图着色；支持对单个社群再做二级细分，并按「大社群 → 子社群 → 成员」分层浏览。</p>
           </div>
           <div class="actions">
             <div class="input-group" style="max-width:180px">
@@ -36,6 +36,21 @@
             <div class="card-title">社群成员（按规模降序）</div>
             <div id="memberList" class="card-body" style="max-height:520px;overflow-y:auto"></div>
           </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">社群层级浏览
+              <span class="sub">大社群 → 子社群 → 成员 · 二级细分独立存储，与全局划分并存、互不影响</span>
+            </div>
+            <div class="row">
+              <button class="btn btn-sm btn-ghost" id="btnNavBack" title="后退">◀ 后退</button>
+              <button class="btn btn-sm btn-ghost" id="btnNavFwd" title="前进">前进 ▶</button>
+              <button class="btn btn-sm" id="btnHierRefresh">刷新</button>
+            </div>
+          </div>
+          <div class="crumb-trail" id="hierCrumb"></div>
+          <div id="hierBody" class="card-body"></div>
         </div>
       </section>
     </main>
@@ -102,6 +117,206 @@
       }).catch((e) => C.toast(e.message, "error"));
     }
 
+    /* ================= 层级浏览（大社群 → 子社群 → 成员） =================
+       浏览状态：{view:"root"} → {view:"comm",comm} → {view:"sub",comm,sub}
+       历史栈支持前进/后退；数据缓存于 hier，渲染只读缓存，保证状态一致。 */
+    const hier = {
+      level0: null,            // /api/community/hierarchy 响应
+      subViews: {},            // commId -> /api/community/sub 响应
+      nav: [{ view: "root" }], // 浏览历史栈
+      navIdx: 0,
+    };
+    let applySeq = 0;          // 异步渲染序号，防止快速点击时乱序
+
+    function curState() { return hier.nav[hier.navIdx]; }
+
+    function navTo(state) {
+      hier.nav = hier.nav.slice(0, hier.navIdx + 1);
+      hier.nav.push(state);
+      hier.navIdx++;
+      applyState();
+    }
+    function navBack() { if (hier.navIdx > 0) { hier.navIdx--; applyState(); } }
+    function navFwd() { if (hier.navIdx < hier.nav.length - 1) { hier.navIdx++; applyState(); } }
+
+    function fmtQ(q) { return q == null ? "—" : Number(q).toFixed(4); }
+    function tileHtml(t) {
+      return '<div class="card stat-tile"><div class="label">' + t.label + '</div><div class="value">' +
+             t.value + '</div><div class="hint">' + t.hint + "</div></div>";
+    }
+
+    function renderCrumb() {
+      const s = curState();
+      const parts = [{ label: "全部社群", state: { view: "root" } }];
+      if (s.view === "comm" || s.view === "sub") {
+        parts.push({ label: "社群 " + s.comm, state: { view: "comm", comm: s.comm } });
+      }
+      if (s.view === "sub") {
+        parts.push({ label: "子社群 " + s.sub, state: { view: "sub", comm: s.comm, sub: s.sub } });
+      }
+      const el = document.getElementById("hierCrumb");
+      el.innerHTML = parts.map((p, i) => {
+        const isCur = i === parts.length - 1;
+        const item = '<button class="crumb-item' + (isCur ? " current" : "") + '" data-crumb="' + i + '"' +
+                     (isCur ? " disabled" : "") + ">" + C.escapeHtml(p.label) + "</button>";
+        return i === 0 ? item : '<span class="crumb-sep">›</span>' + item;
+      }).join("");
+      el.querySelectorAll("[data-crumb]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const target = parts[+btn.dataset.crumb];
+          if (target) navTo(target.state);
+        });
+      });
+      document.getElementById("btnNavBack").disabled = hier.navIdx <= 0;
+      document.getElementById("btnNavFwd").disabled = hier.navIdx >= hier.nav.length - 1;
+    }
+
+    async function applyState() {
+      renderCrumb();
+      const seq = ++applySeq;
+      const s = curState();
+      const body = document.getElementById("hierBody");
+      body.innerHTML = C.spinner();
+      try {
+        if (!hier.level0) hier.level0 = await api.communityHierarchy();
+        if (s.view !== "root" && !hier.subViews[s.comm]) {
+          hier.subViews[s.comm] = await api.subcommunity(s.comm);
+        }
+        if (seq !== applySeq) return;   // 期间又发生了导航，放弃本次渲染
+        if (s.view === "root") renderRoot(body);
+        else if (s.view === "comm") renderComm(body, s.comm);
+        else renderSub(body, s.comm, s.sub);
+      } catch (e) {
+        if (seq !== applySeq) return;
+        if (s.view !== "root") {
+          // 当前社群在最新全局划分中已不存在：回到大社群层，保持状态一致
+          C.toast("该社群已不在当前全局划分中，已返回大社群层", "warning");
+          hier.level0 = null; hier.subViews = {};
+          hier.nav = [{ view: "root" }]; hier.navIdx = 0;
+          applyState();
+        } else {
+          body.innerHTML = C.emptyState("◈", e.message);
+        }
+      }
+    }
+
+    function renderRoot(body) {
+      const d = hier.level0;
+      const list = d.communities || [];
+      if (!list.length) {
+        body.innerHTML = C.emptyState("◈", "暂无全局社群划分，请先点击上方「重新计算」");
+        return;
+      }
+      const divided = list.filter((c) => c.sub && !c.sub.stale).length;
+      const tiles = [
+        { label: "大社群数量", value: d.num_communities, hint: "全局 Louvain 划分" },
+        { label: "全局模块度 Q", value: fmtQ(d.modularity), hint: "各社群贡献之和" },
+        { label: "已二级细分", value: divided + " / " + list.length, hint: "细分结果独立存储" },
+        { label: "全局划分时间", value: d.computed_at ? new Date(d.computed_at).toLocaleTimeString("zh-CN") : "—", hint: "分辨率 " + (d.resolution || 1.0) },
+      ];
+      let html = '<div class="grid cols-4">' + tiles.map(tileHtml).join("") + "</div>";
+      html += '<div class="mt-16">' + list.map((c) => {
+        const sub = c.sub;
+        let status;
+        if (!sub) status = '<span class="badge">未细分</span>';
+        else if (sub.stale) status = '<span class="badge warning">已过期</span>';
+        else status = '<span class="badge success">' + sub.num_communities + " 个子社群</span>";
+        return '<button class="hier-row" data-comm="' + c.community + '">' +
+          '<span class="swatch" style="background:' + C.colorFor(c.community) + '"></span>' +
+          '<span class="hier-name">社群 ' + c.community + "</span>" +
+          '<span class="hier-meta">规模 <span class="mono">' + c.size + '</span> 人 · 模块度贡献 <span class="mono">' + fmtQ(c.modularity) + "</span></span>" +
+          '<span class="hier-end">' + status + '<span class="hier-arrow">›</span></span>' +
+          "</button>";
+      }).join("") + "</div>";
+      body.innerHTML = html;
+      body.querySelectorAll("[data-comm]").forEach((el) => {
+        el.addEventListener("click", () => navTo({ view: "comm", comm: +el.dataset.comm }));
+      });
+    }
+
+    function renderComm(body, commId) {
+      const view = hier.subViews[commId];
+      const e = view.entry;
+      const tiles = [
+        { label: "当前大社群", value: "社群 " + commId, hint: "规模 " + view.parent_size + " 人" },
+        { label: "全局模块度贡献", value: fmtQ(view.parent_modularity), hint: "全局 Q " + fmtQ(view.global_modularity) },
+        { label: "子社群数量", value: e ? e.num_communities : "—", hint: e ? "社群内部二级 Louvain" : "尚未细分" },
+        { label: "子图模块度 Q", value: e ? fmtQ(e.modularity) : "—", hint: e ? "耗时 " + e.time_ms.toFixed(1) + " ms" : "在社群内部再划分" },
+      ];
+      let html = '<div class="grid cols-4">' + tiles.map(tileHtml).join("") + "</div>";
+      if (e && view.stale) {
+        html += '<div class="mt-16"><span class="badge warning">全局划分已更新，此细分结果可能过期，建议重新细分</span></div>';
+      }
+      if (!e) {
+        html += '<div class="empty"><div class="big">◈</div><div>社群 ' + commId + " 尚未进行二级细分</div>" +
+                '<div class="mt-16"><button class="btn btn-primary" id="btnDoSub">计算二级细分</button></div></div>';
+      } else {
+        html += '<div class="mt-16 row spread"><div class="muted small">子社群列表（按规模降序）</div>' +
+                '<button class="btn btn-sm" id="btnDoSub">重新细分</button></div>';
+        html += '<div class="mt-8">' + (e.sub_sizes || []).map((s) =>
+          '<button class="hier-row" data-sub="' + s.sub + '">' +
+          '<span class="swatch" style="background:' + C.colorFor(s.sub) + '"></span>' +
+          '<span class="hier-name">子社群 ' + s.sub + "</span>" +
+          '<span class="hier-meta">规模 <span class="mono">' + s.size + '</span> 人 · 模块度贡献 <span class="mono">' + fmtQ(s.modularity) + "</span></span>" +
+          '<span class="hier-end"><span class="badge">成员</span><span class="hier-arrow">›</span></span>' +
+          "</button>"
+        ).join("") + "</div>";
+        if (e.num_communities <= 1) {
+          html += '<div class="faint small mt-8">该社群内部结构紧密，二级细分仅得到 1 个子社群。</div>';
+        }
+      }
+      body.innerHTML = html;
+      const btn = document.getElementById("btnDoSub");
+      if (btn) btn.addEventListener("click", () => doComputeSub(commId, !!view.entry));
+      body.querySelectorAll("[data-sub]").forEach((el) => {
+        el.addEventListener("click", () => navTo({ view: "sub", comm: commId, sub: +el.dataset.sub }));
+      });
+    }
+
+    function renderSub(body, commId, subId) {
+      const view = hier.subViews[commId];
+      const e = view && view.entry;
+      if (!e || !e.members || !e.members[String(subId)]) {
+        body.innerHTML = C.emptyState("◈", "子社群不存在，请通过面包屑返回重新选择");
+        return;
+      }
+      const members = e.members[String(subId)];
+      const meta = (e.sub_sizes || []).find((s) => s.sub === subId) || {};
+      const pct = view.parent_size ? (members.length / view.parent_size * 100).toFixed(1) + "%" : "—";
+      const tiles = [
+        { label: "当前子社群", value: "子社群 " + subId, hint: "属于社群 " + commId },
+        { label: "成员数", value: members.length, hint: "占大社群 " + pct },
+        { label: "模块度贡献", value: fmtQ(meta.modularity), hint: "子图 Q " + fmtQ(e.modularity) },
+        { label: "细分时间", value: e.computed_at ? new Date(e.computed_at).toLocaleTimeString("zh-CN") : "—", hint: "分辨率 " + (e.resolution || 1.0) },
+      ];
+      let html = '<div class="grid cols-4">' + tiles.map(tileHtml).join("") + "</div>";
+      html += '<div class="mt-16 muted small">成员列表（' + members.length + " 人）</div>";
+      html += '<div class="row wrap mt-8">' +
+        members.map((id) => '<span class="badge">' + C.escapeHtml(id) + "</span>").join(" ") +
+        "</div>";
+      body.innerHTML = html;
+    }
+
+    function doComputeSub(commId, force) {
+      const res = parseFloat(document.getElementById("resolution").value) || 1.0;
+      document.getElementById("hierBody").innerHTML = C.spinner();
+      api.computeSubcommunity(commId, res, force).then((entry) => {
+        delete hier.subViews[commId];   // 强制重新拉取视图
+        hier.level0 = null;             // 根层“细分状态”列已变化
+        C.toast("社群 " + commId + " 二级细分完成：" + entry.num_communities + " 个子社群", "success");
+        applyState();
+      }).catch((e) => {
+        C.toast(e.message, "error");
+        applyState();
+      });
+    }
+
+    function loadHierarchy() {
+      hier.level0 = null;
+      hier.subViews = {};
+      applyState();   // 保留浏览位置，仅刷新数据；社群失效时自动回退根层
+    }
+
     C.initPage("community", function () {
       document.getElementById("btnCompute").addEventListener("click", () => {
         const res = parseFloat(document.getElementById("resolution").value) || 1.0;
@@ -109,11 +324,18 @@
         btn.disabled = true; btn.textContent = "计算中…";
         api.computeCommunity(res).then((d) => {
           renderTiles(d); renderBars(d); renderMembers(d);
+          // 全局划分已更新：层级浏览回到根层并刷新（细分过期状态随之更新）
+          hier.nav = [{ view: "root" }]; hier.navIdx = 0;
+          loadHierarchy();
           C.toast("社群划分完成：" + d.num_communities + " 个社群", "success");
         }).catch((e) => C.toast(e.message, "error"))
           .finally(() => { btn.disabled = false; btn.textContent = "重新计算"; });
       });
+      document.getElementById("btnNavBack").addEventListener("click", navBack);
+      document.getElementById("btnNavFwd").addEventListener("click", navFwd);
+      document.getElementById("btnHierRefresh").addEventListener("click", loadHierarchy);
       load();
+      loadHierarchy();
     });
   </script>
 </body>

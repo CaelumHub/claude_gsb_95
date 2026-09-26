@@ -17,6 +17,7 @@ Responsibilities
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from collections import Counter, defaultdict
@@ -30,8 +31,10 @@ try:
         bfs_shortest_path,
         common_friends,
         hybrid_recommend,
+        induced_subgraph,
         jaccard_similarity,
         louvain,
+        modularity_breakdown,
         pagerank,
         shortest_path,
     )
@@ -47,8 +50,10 @@ except ImportError:  # pragma: no cover
         bfs_shortest_path,
         common_friends,
         hybrid_recommend,
+        induced_subgraph,
         jaccard_similarity,
         louvain,
+        modularity_breakdown,
         pagerank,
         shortest_path,
     )
@@ -73,6 +78,14 @@ class SocialGraphService:
         self._rec_cache: Dict[int, dict] = self.derived.load_recommendations()
         self._community_dirty = False
         self._pagerank_dirty = False
+        # Second-level community cache: parent community id -> sub-division
+        # entry.  Lazily hydrated from ``subcommunity.json`` on first use and
+        # kept alongside (never instead of) the global partition.
+        self._sub_cache: Dict[int, dict] = {}
+        self._sub_loaded = False
+        # Memoised per-community modularity contributions for the hierarchy
+        # view, keyed by the base partition's ``computed_at``.
+        self._hier_contrib: Optional[Tuple[tuple, Dict[int, float]]] = None
 
     # ------------------------------------------------------------------
     # Graph access / caching
@@ -351,7 +364,7 @@ class SocialGraphService:
     # ------------------------------------------------------------------
     def compute_community(self, resolution: Optional[float] = None, force: bool = False) -> dict:
         graph = self.get_graph()
-        res = config.LOUVAIN_RESOLUTION
+        res = resolution if resolution else config.LOUVAIN_RESOLUTION
         with config.Timed() as timer:
             result = louvain(graph, resolution=res)
         result["resolution"] = res
@@ -373,22 +386,36 @@ class SocialGraphService:
             result["community_map"][str(node)] = int(comm)
         self._community_cache = result
         self._community_dirty = True
+        # Persist so the file-backed read path (and any restart) sees the same
+        # partition; sub-division signatures stay comparable across restarts.
+        self.derived.save_community(result)
         return result
 
     def get_community(self) -> dict:
         if self._community_dirty:
             self._community_dirty = False
+        result = None
         if self._community_cache is not None:
-            return self._community_cache
-        cached = self.derived.load_community()
-        if cached.get("communities") or cached.get("num_communities", 0) > 0:
-            return cached
-        return {
-            "communities": {},
-            "num_communities": 0,
-            "modularity": 0.0,
-            "computed_at": 0,
-        }
+            result = self._community_cache
+        else:
+            cached = self.derived.load_community()
+            if cached.get("communities") or cached.get("num_communities", 0) > 0:
+                result = cached
+        if result is None:
+            return {
+                "communities": {},
+                "num_communities": 0,
+                "modularity": 0.0,
+                "computed_at": 0,
+            }
+        # Normalise node ids to int keys: JSON persistence turns them into
+        # strings, and in-process consumers (graph colouring, profiles,
+        # export, hierarchy) look up by int node id.
+        comms = result.get("communities") or {}
+        if comms and any(not isinstance(k, int) for k in comms):
+            result = dict(result)
+            result["communities"] = {int(n): c for n, c in comms.items()}
+        return result
 
     def _community_of(self, uid: int) -> int:
         comm = self.get_community()
@@ -398,6 +425,205 @@ class SocialGraphService:
         if uid in communities:
             return communities[uid]
         return -1
+
+    # ------------------------------------------------------------------
+    # Hierarchical (second-level) communities
+    # ------------------------------------------------------------------
+    def _ensure_sub_cache(self) -> None:
+        """Hydrate the sub-division cache from disk exactly once."""
+        with self._lock:
+            if self._sub_loaded:
+                return
+            data = self.derived.load_subcommunity()
+            self._sub_cache = {
+                int(k): v for k, v in data.get("sub", {}).items()
+                if isinstance(v, dict)
+            }
+            self._sub_loaded = True
+
+    def _persist_sub_cache(self) -> None:
+        payload = {
+            "version": 1,
+            "sub": {str(k): v for k, v in sorted(self._sub_cache.items())},
+        }
+        self.derived.save_subcommunity(payload)
+
+    @staticmethod
+    def _members_sig(members: List[int]) -> str:
+        """Stable fingerprint of a community's member set.
+
+        A cached sub-division stays valid exactly while its parent community
+        keeps the same members -- this survives global recomputes that
+        reproduce the identical partition (e.g. same resolution, fixed seed).
+        """
+        digest = hashlib.sha1()
+        digest.update(",".join(str(n) for n in sorted(members)).encode("utf-8"))
+        return digest.hexdigest()[:16]
+
+    def _base_partition(self) -> Tuple[dict, Dict[int, int]]:
+        """Return the global partition as ``(raw_result, {node: community})``."""
+        base = self.get_community()
+        raw = base.get("communities") or {}
+        comm_map = {int(n): int(c) for n, c in raw.items()}
+        return base, comm_map
+
+    def _global_contributions(self, base: dict, comm_map: Dict[int, int]) -> Dict[int, float]:
+        """Per-community modularity contributions of the global partition.
+
+        Memoised on the partition's ``computed_at`` so repeated hierarchy
+        views don't rescan the graph.
+        """
+        key = (base.get("computed_at", 0), len(comm_map))
+        if self._hier_contrib and self._hier_contrib[0] == key:
+            return self._hier_contrib[1]
+        contribs, _total = modularity_breakdown(self.get_graph(), comm_map)
+        self._hier_contrib = (key, contribs)
+        return contribs
+
+    def community_hierarchy(self) -> dict:
+        """Level-0 view: every top-level community with size, modularity
+        contribution and the status of its (optional) second-level division.
+        """
+        base, comm_map = self._base_partition()
+        out = {
+            "num_communities": base.get("num_communities", 0),
+            "modularity": base.get("modularity", 0.0),
+            "computed_at": base.get("computed_at", 0),
+            "resolution": base.get("resolution", config.LOUVAIN_RESOLUTION),
+            "communities": [],
+        }
+        if not comm_map:
+            return out
+
+        contribs = self._global_contributions(base, comm_map)
+        members: Dict[int, List[int]] = defaultdict(list)
+        for nid, comm in comm_map.items():
+            members[comm].append(nid)
+
+        self._ensure_sub_cache()
+        items = []
+        for comm, nodes in sorted(members.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            item = {
+                "community": comm,
+                "size": len(nodes),
+                "modularity": round(contribs.get(comm, 0.0), 6),
+                "sub": None,
+            }
+            entry = self._sub_cache.get(comm)
+            if entry:
+                item["sub"] = {
+                    "num_communities": entry.get("num_communities", 0),
+                    "modularity": entry.get("modularity", 0.0),
+                    "computed_at": entry.get("computed_at", 0),
+                    "stale": entry.get("members_sig") != self._members_sig(nodes),
+                }
+            items.append(item)
+        out["communities"] = items
+        return out
+
+    def subcommunity_view(self, community_id: int) -> Optional[dict]:
+        """Level-1/2 view for one top-level community.
+
+        Returns ``None`` when the parent community does not exist in the
+        current global partition; otherwise a dict with the parent summary
+        plus the cached sub-division entry (or ``computed: False``).
+        """
+        hier = self.community_hierarchy()
+        parent = next(
+            (c for c in hier["communities"] if c["community"] == community_id),
+            None,
+        )
+        if parent is None:
+            return None
+        self._ensure_sub_cache()
+        entry = self._sub_cache.get(community_id)
+        stale = bool(entry) and bool(parent["sub"]) and parent["sub"]["stale"]
+        return {
+            "parent": community_id,
+            "parent_size": parent["size"],
+            "parent_modularity": parent["modularity"],
+            "global_modularity": hier["modularity"],
+            "global_computed_at": hier["computed_at"],
+            "computed": entry is not None,
+            "stale": stale,
+            "entry": entry,
+        }
+
+    def compute_subcommunity(
+        self,
+        community_id: int,
+        resolution: Optional[float] = None,
+        force: bool = False,
+    ) -> dict:
+        """Run Louvain *inside* one top-level community (second level).
+
+        The induced subgraph of the community's members is partitioned with
+        the same Louvain routine as the global pass, so sub-communities are
+        correct modularity optimisations of the intra-community structure.
+        The result is cached and persisted to ``subcommunity.json``; the
+        global partition (``community.json``) and its colouring are left
+        untouched.
+        """
+        base, comm_map = self._base_partition()
+        if not comm_map:
+            raise ValueError("请先计算全局社群划分")
+        members = sorted(n for n, c in comm_map.items() if c == community_id)
+        if not members:
+            raise ValueError(f"社群 {community_id} 不存在或没有成员")
+
+        base_ts = base.get("computed_at", 0)
+        members_sig = self._members_sig(members)
+        self._ensure_sub_cache()
+        cached = self._sub_cache.get(community_id)
+        if (
+            cached is not None
+            and not force
+            and cached.get("members_sig") == members_sig
+        ):
+            return cached
+
+        res = resolution if resolution else config.LOUVAIN_RESOLUTION
+        graph = self.get_graph()
+        sub = induced_subgraph(graph, members)
+        with config.Timed() as timer:
+            result = louvain(sub, resolution=res)
+
+        assign = {int(n): int(c) for n, c in result["communities"].items()}
+        contribs, _total = modularity_breakdown(sub, assign)
+        groups: Dict[int, List[int]] = defaultdict(list)
+        for nid, comm in assign.items():
+            groups[comm].append(nid)
+
+        entry = {
+            "parent": community_id,
+            "parent_size": len(members),
+            "parent_modularity": base.get("modularity", 0.0),
+            "base_computed_at": base_ts,
+            "members_sig": members_sig,
+            "resolution": res,
+            "communities": {str(n): c for n, c in sorted(assign.items())},
+            "num_communities": result["num_communities"],
+            "modularity": result["modularity"],
+            "iterations": result["iterations"],
+            "time_ms": round(timer.elapsed_ms, 2),
+            "computed_at": config.now_ms(),
+            "sub_sizes": [
+                {
+                    "sub": c,
+                    "size": len(nodes),
+                    "modularity": round(contribs.get(c, 0.0), 6),
+                }
+                for c, nodes in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+            ],
+            "members": {
+                str(c): [str(n) for n in sorted(nodes)]
+                for c, nodes in sorted(groups.items())
+            },
+        }
+        with self._lock:
+            self._sub_cache[community_id] = entry
+            self._persist_sub_cache()
+        return entry
 
     def compute_pagerank(self, top: int = 20, force: bool = False) -> dict:
         with self._lock:

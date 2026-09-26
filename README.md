@@ -3,8 +3,8 @@
 一个 **零第三方依赖**（Python 后端纯标准库，前端仅引 vis.js CDN）的社交网络图分析
 与推荐系统。前端 10 个页面覆盖用户管理、关系导入、图可视化、路径与共同好友、
 社群发现、个性化推荐、统计面板、系统设置、数据导出与标签管理；后端实现邻接表图
-构建、BFS 最短路径、PageRank、Louvain 社群划分，以及协同过滤 + 图嵌入 + 标签的
-混合推荐。
+构建、BFS 最短路径、PageRank、Louvain 社群划分（含社群内部二级细分与层级浏览），
+以及协同过滤 + 图嵌入 + 标签的混合推荐。
 
 ---
 
@@ -56,7 +56,7 @@ gsb3/
 │   ├── import.html             # 2. 关系导入
 │   ├── graph.html              # 3. 图可视化（vis.js 缩放拖拽、路径高亮）
 │   ├── path.html               # 4. 最短路径与共同好友查询
-│   ├── community.html          # 5. 社群发现（Louvain 着色）
+│   ├── community.html          # 5. 社群发现（Louvain 着色 + 层级细分浏览）
 │   ├── recommend.html          # 6. 个性化推荐列表
 │   ├── stats.html              # 7. 统计面板
 │   ├── settings.html           # 8. 系统设置
@@ -71,6 +71,7 @@ gsb3/
     ├── tags.json               # 标签体系
     ├── recommendations.json    # 推荐结果（单独存储）
     ├── community.json          # Louvain 结果缓存
+    ├── subcommunity.json       # 社群内部二级细分结果（与全局划分并存）
     ├── pagerank.json           # PageRank 结果缓存
     ├── index.json              # 用户 → 分片 索引
     └── settings.json           # 系统设置
@@ -105,6 +106,7 @@ gsb3/
 | 最短路径 | 经典 BFS + **双向 BFS**（大图自动切换，搜索面 O(b^(d/2))） |
 | PageRank | 幂迭代，显式处理 dangling 节点，O(n) 内存，L1 收敛判定 |
 | Louvain | 两阶段模块度优化：局部移动（ΔQ 增量公式）+ 聚合，迭代至收敛，固定种子可复现，`min_improvement` 早停 |
+| 层级社群 | 对单个社群提取诱导子图再做一次 Louvain 二级细分；每层输出规模与模块度贡献（各社群贡献之和恒等于该层总 Q），结果独立存于 `subcommunity.json`，与全局划分并存、互不影响 |
 | 协同过滤 | 朋友的朋友 + Adamic-Adar 权重去偏，仅依赖邻域规模 |
 | 图嵌入 | 距离-地标（landmark）定位嵌入：L 次有界 BFS 得到低维向量，捕捉结构相似性，无需神经网络训练 |
 | 冷启动 | 好友数低于阈值时退化为「热门 + 标签重叠」 |
@@ -132,6 +134,8 @@ gsb3/
 | GET | `/api/graph` · `/api/graph/neighborhood` | 全图 / 邻域子图 |
 | GET | `/api/path` · `/api/common-friends` | 最短路径 / 共同好友 |
 | GET/POST | `/api/community` · `/api/community/compute` | Louvain 结果 / 重算 |
+| GET | `/api/community/hierarchy` | 大社群层：规模 + 模块度贡献 + 细分状态 |
+| GET/POST | `/api/community/sub` · `/api/community/sub/compute` | 某社群的二级细分 / 计算细分 |
 | GET | `/api/pagerank?top=` | PageRank 中心性 |
 | GET/POST | `/api/recommend/<id>` · `/api/recommend` | 单用户 / 批量推荐 |
 | GET | `/api/stats` | 统计面板聚合 |
