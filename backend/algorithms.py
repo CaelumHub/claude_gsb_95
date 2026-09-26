@@ -7,6 +7,7 @@ Graph algorithms implemented for **memory-efficient, large-scale execution**.
 * ``bidirectional_shortest_path`` -- meets-in-the-middle, much faster on big graphs
 * ``pagerank``                   -- power iteration over CSR with dangling-node fix
 * ``louvain``                    -- two-phase modularity optimisation w/ early stop
+* ``subdivide_community``        -- second-level Louvain inside one community
 * ``recommend_*``                -- collaborative filtering + embedding + cold start
   + diversity re-ranking (MMR)
 
@@ -389,8 +390,10 @@ def louvain(
         comm_nodes[c].discard(i)
         comm_degree[c] -= d_i
         # internal weight: subtract weight to neighbours in same community.
+        # Edges are counted twice (once per endpoint), matching the standard
+        # Q = internal_2x / 2m - (degree / 2m)^2 decomposition.
         internal = sum(w for j, w in adj[i] if node_comm[j] == c)
-        comm_internal[c] -= internal
+        comm_internal[c] -= 2.0 * internal
         if not comm_nodes[c]:
             del comm_nodes[c]
 
@@ -398,7 +401,7 @@ def louvain(
         comm_nodes.setdefault(c, set()).add(i)
         comm_degree[c] += d_i
         internal = sum(w for j, w in adj[i] if node_comm[j] == c)
-        comm_internal[c] += internal
+        comm_internal[c] += 2.0 * internal
 
     rng = random.Random(seed)
     iterations = 0
@@ -447,6 +450,79 @@ def louvain(
         "iterations": iterations,
         "num_communities": len(ordered),
     }
+
+
+# ===========================================================================
+# Hierarchical (second-level) community subdivision
+# ===========================================================================
+def induced_subgraph(graph: Graph, nodes) -> Graph:
+    """Return the frozen subgraph induced by ``nodes``.
+
+    Only edges with *both* endpoints inside the set are kept, so a second-level
+    Louvain run sees purely internal structure.  Isolated members are preserved
+    as singleton nodes (each becomes its own sub-community).
+    """
+    node_set = {int(n) for n in nodes}
+    sub = Graph(directed=False)
+    for nid in node_set:
+        sub.add_node(nid)
+    for u in node_set:
+        if not graph.has_node(u):
+            continue
+        for v, w in graph.neighbors_with_weights(u):
+            if v in node_set and u < v:
+                sub.add_edge(u, v, w)
+    sub.freeze()
+    return sub
+
+
+def modularity_contributions(graph: Graph, communities: Dict) -> Dict[int, float]:
+    """Per-community modularity contribution; the values sum to total Q.
+
+    ``communities`` maps node id (``int`` or ``str``) to a community id.  Uses
+    the same ``Q_c = internal_c / 2m - (degree_c / 2m)^2`` decomposition as
+    :func:`louvain`, so per-level / per-community scores are directly
+    comparable.
+    """
+    comm_of = {int(node): int(c) for node, c in communities.items()}
+    m2 = 0.0  # counted over every directed adjacency entry => 2 * edge weight
+    degree_sum: Dict[int, float] = defaultdict(float)
+    internal: Dict[int, float] = defaultdict(float)
+    for u in graph.nodes:
+        c = comm_of.get(u)
+        if c is None:
+            continue
+        for v, w in graph.neighbors_with_weights(u):
+            m2 += w
+            degree_sum[c] += w
+            if comm_of.get(v) == c:
+                internal[c] += w
+    if m2 == 0.0:
+        return {c: 0.0 for c in degree_sum}
+    inv_m2 = 1.0 / m2
+    return {
+        c: internal.get(c, 0.0) * inv_m2 - (deg * inv_m2) ** 2
+        for c, deg in degree_sum.items()
+    }
+
+
+def subdivide_community(
+    graph: Graph,
+    members,
+    resolution: float = config.LOUVAIN_RESOLUTION,
+    seed: int = config.LOUVAIN_RANDOM_SEED,
+) -> Dict[str, object]:
+    """Second-level Louvain split *inside* one (global) community.
+
+    Builds the induced subgraph of ``members`` and runs :func:`louvain` on it
+    independently, so the result reflects genuine internal structure rather
+    than a re-slicing of the global assignment.  Adds a ``modularities`` map
+    (sub-community id -> modularity contribution within the subgraph).
+    """
+    sub = induced_subgraph(graph, members)
+    result = louvain(sub, resolution=resolution, seed=seed)
+    result["modularities"] = modularity_contributions(sub, result["communities"])
+    return result
 
 
 # ===========================================================================

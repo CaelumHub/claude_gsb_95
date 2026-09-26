@@ -25,6 +25,9 @@ Endpoint summary (all under ``/api``):
     GET    /api/common-friends        ?source&target
     GET    /api/community             (cached)
     POST   /api/community/compute     {resolution?}
+    GET    /api/community/tree        (hierarchy: 大社群 -> 子社群)
+    POST   /api/community/subdivide   {community, resolution?}
+    GET    /api/community/subcommunities/<id>
     GET    /api/pagerank              ?top&refresh
     GET    /api/recommend/<id>        ?k&refresh&strategy
     POST   /api/recommend             {ids:[...], k}
@@ -281,6 +284,27 @@ class ApiRouter:
             resolution = _to_float((body or {}).get("resolution"), config.LOUVAIN_RESOLUTION)
             force = _to_bool(str((body or {}).get("force", "true")))
             return 200, self.service.compute_community(resolution=resolution, force=True)
+
+        # --- community hierarchy (second-level subdivision) ---
+        if route == "/community/tree" and method == "GET":
+            return 200, self.service.community_tree()
+        if route == "/community/subdivide" and method == "POST":
+            b = body or {}
+            cid = b.get("community")
+            if cid is None:
+                return _error("缺少 community 参数")
+            resolution = b.get("resolution")
+            resolution = None if resolution is None else _to_float(resolution, config.LOUVAIN_RESOLUTION)
+            try:
+                return 200, self.service.compute_subcommunity(int(cid), resolution=resolution)
+            except ValueError as exc:
+                return _error(str(exc), 404)
+        m = re.fullmatch(r"/community/subcommunities/(\d+)", route)
+        if m and method == "GET":
+            sub = self.service.get_subcommunity(int(m.group(1)))
+            if sub is None:
+                return _error("该社群尚未进行二级细分", 404)
+            return 200, sub
 
         # --- pagerank ---
         if route == "/pagerank" and method == "GET":

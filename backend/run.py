@@ -54,10 +54,17 @@ def _check() -> int:
     lv = algorithms.louvain(g)
     assert lv["num_communities"] >= 2, lv  # cliques should separate
 
+    # Second-level subdivision: re-partitioning the whole node set must find
+    # the same cliques, and per-community contributions must sum to total Q.
+    sub = algorithms.subdivide_community(g, [1, 2, 3, 4, 5, 6])
+    assert sub["num_communities"] >= 2, sub
+    contrib = algorithms.modularity_contributions(g, lv["communities"])
+    assert abs(sum(contrib.values()) - lv["modularity"]) < 1e-6, contrib
+
     rec = algorithms.hybrid_recommend(g, 1, k=3)
     assert "items" in rec
 
-    print("[check] OK: graph, bfs, pagerank, louvain, recommend all pass")
+    print("[check] OK: graph, bfs, pagerank, louvain, subdivide, recommend all pass")
     return 0
 
 

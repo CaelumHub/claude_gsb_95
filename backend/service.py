@@ -32,8 +32,10 @@ try:
         hybrid_recommend,
         jaccard_similarity,
         louvain,
+        modularity_contributions,
         pagerank,
         shortest_path,
+        subdivide_community,
     )
     from .graph import Graph
     from .storage import DerivedStore, GraphStore, rebuild_index_from_shards
@@ -49,8 +51,10 @@ except ImportError:  # pragma: no cover
         hybrid_recommend,
         jaccard_similarity,
         louvain,
+        modularity_contributions,
         pagerank,
         shortest_path,
+        subdivide_community,
     )
     from graph import Graph
     from storage import DerivedStore, GraphStore, rebuild_index_from_shards
@@ -73,6 +77,8 @@ class SocialGraphService:
         self._rec_cache: Dict[int, dict] = self.derived.load_recommendations()
         self._community_dirty = False
         self._pagerank_dirty = False
+        # Second-level subdivisions keyed by global community id.
+        self._subcommunity_cache: Dict[int, dict] = {}
 
     # ------------------------------------------------------------------
     # Graph access / caching
@@ -94,6 +100,9 @@ class SocialGraphService:
             self._graph_dirty = True
             self._community_dirty = False
             self._pagerank_dirty = True
+            # Topology changed: subdivisions no longer match any partition.
+            self._subcommunity_cache = {}
+            self.derived.clear_subcommunities()
 
     def graph_stats(self) -> dict:
         graph = self.get_graph()
@@ -373,6 +382,9 @@ class SocialGraphService:
             result["community_map"][str(node)] = int(comm)
         self._community_cache = result
         self._community_dirty = True
+        # A new global partition invalidates every second-level subdivision.
+        self._subcommunity_cache = {}
+        self.derived.clear_subcommunities()
         return result
 
     def get_community(self) -> dict:
@@ -398,6 +410,111 @@ class SocialGraphService:
         if uid in communities:
             return communities[uid]
         return -1
+
+    # ------------------------------------------------------------------
+    # Hierarchical communities (second-level subdivision)
+    # ------------------------------------------------------------------
+    def _subcommunity_store(self) -> Dict[int, dict]:
+        """In-memory subdivision cache, lazily hydrated from disk."""
+        with self._lock:
+            if not self._subcommunity_cache:
+                self._subcommunity_cache = self.derived.load_subcommunities()
+            return self._subcommunity_cache
+
+    def get_subcommunity(self, community_id: int) -> Optional[dict]:
+        return self._subcommunity_store().get(community_id)
+
+    def compute_subcommunity(self, community_id: int, resolution: Optional[float] = None) -> dict:
+        """Second-level Louvain split *inside* one global community.
+
+        The induced subgraph of the community's members is partitioned on its
+        own, so the result reflects genuine internal structure.  It is stored
+        separately from (and never overwrites) the global partition, which
+        keeps global colouring untouched.
+        """
+        base = self.get_community()
+        communities = base.get("communities", {})
+        if not communities:
+            base = self.compute_community()
+            communities = base.get("communities", {})
+        members = sorted(int(n) for n, c in communities.items() if int(c) == community_id)
+        if not members:
+            raise ValueError(f"社群 {community_id} 不存在或没有成员")
+
+        graph = self.get_graph()
+        res = config.LOUVAIN_RESOLUTION if resolution is None else float(resolution)
+        with config.Timed() as timer:
+            sub = subdivide_community(graph, members, resolution=res)
+
+        by_sub: Dict[int, List[int]] = defaultdict(list)
+        for node, sid in sub["communities"].items():
+            by_sub[int(sid)].append(int(node))
+        modularities = sub.get("modularities", {})
+        sizes = [
+            {
+                "sub": sid,
+                "size": len(nodes),
+                "modularity": round(modularities.get(sid, 0.0), 6),
+            }
+            for sid, nodes in sorted(by_sub.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        ]
+        result = {
+            "community": community_id,
+            "size": len(members),
+            "resolution": res,
+            "modularity": round(sub["modularity"], 6),
+            "iterations": sub["iterations"],
+            "num_subcommunities": sub["num_communities"],
+            "subcommunities": {str(n): int(s) for n, s in sub["communities"].items()},
+            "subcommunity_sizes": sizes,
+            "members": {str(sid): [str(n) for n in sorted(nodes)] for sid, nodes in by_sub.items()},
+            "time_ms": round(timer.elapsed_ms, 2),
+            "computed_at": config.now_ms(),
+        }
+        with self._lock:
+            store = self._subcommunity_store()
+            store[community_id] = result
+            self.derived.save_subcommunities(store)
+        return result
+
+    def community_tree(self) -> dict:
+        """Hierarchy view: global communities plus any computed subdivisions.
+
+        Level 1 rows carry their modularity contribution to the global Q;
+        subdivided communities additionally expose their level-2 summary so
+        the UI can render the 大社群 -> 子社群 -> 成员 drill-down.
+        """
+        base = self.get_community()
+        communities = base.get("communities", {})
+        modularities: Dict[int, float] = {}
+        if communities:
+            modularities = modularity_contributions(self.get_graph(), communities)
+        counts = Counter(int(c) for c in communities.values())
+        subs = self._subcommunity_store()
+        children = []
+        for cid, size in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            sub = subs.get(cid)
+            node = {
+                "id": cid,
+                "size": size,
+                "modularity": round(modularities.get(cid, 0.0), 6),
+                "subdivided": sub is not None,
+            }
+            if sub is not None:
+                node["num_subcommunities"] = sub.get("num_subcommunities", 0)
+                node["sub_modularity"] = sub.get("modularity", 0.0)
+            children.append(node)
+        # Level-1 Q is the sum of per-community contributions, so the parent
+        # figure always equals the sum of its children in the hierarchy view.
+        modularity = round(sum(modularities.values()), 6) if modularities else base.get("modularity", 0.0)
+        return {
+            "num_communities": base.get("num_communities", len(children)),
+            "modularity": modularity,
+            "resolution": base.get("resolution", config.LOUVAIN_RESOLUTION),
+            "computed_at": base.get("computed_at", 0),
+            "subdivided_count": sum(1 for c in children if c["subdivided"]),
+            "children": children,
+        }
 
     def compute_pagerank(self, top: int = 20, force: bool = False) -> dict:
         with self._lock:

@@ -436,6 +436,23 @@ class DerivedStore:
     def save_community(self, community: dict) -> None:
         config.atomic_write_json(config.COMMUNITY_FILE, community)
 
+    def load_subcommunities(self) -> Dict[int, dict]:
+        """Second-level subdivisions keyed by global community id."""
+        data = config.read_json(config.SUBCOMMUNITY_FILE, {"subdivisions": {}})
+        return {int(k): v for k, v in data.get("subdivisions", {}).items()}
+
+    def save_subcommunities(self, subs: Dict[int, dict]) -> None:
+        config.atomic_write_json(
+            config.SUBCOMMUNITY_FILE, {"subdivisions": {str(k): v for k, v in subs.items()}}
+        )
+
+    def clear_subcommunities(self) -> None:
+        """Drop persisted subdivisions (global partition or graph changed)."""
+        try:
+            os.remove(config.SUBCOMMUNITY_FILE)
+        except OSError:
+            pass
+
     def load_pagerank(self) -> dict:
         return config.read_json(config.PAGERANK_FILE, {})
 

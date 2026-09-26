@@ -37,6 +37,22 @@
             <div id="memberList" class="card-body" style="max-height:520px;overflow-y:auto"></div>
           </div>
         </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">社群层级浏览 <span class="sub">大社群 → 子社群 → 成员，二级细分与全局划分并存，互不影响</span></div>
+            <div class="row">
+              <div class="input-group" style="max-width:110px">
+                <input class="input" id="subResolution" type="number" step="0.1" value="1.0" title="二级细分分辨率">
+              </div>
+              <button class="btn btn-ghost btn-sm" id="btnBack" title="返回上一层">◀ 后退</button>
+              <button class="btn btn-ghost btn-sm" id="btnFwd" title="前进到下一层">前进 ▶</button>
+            </div>
+          </div>
+          <div class="row wrap" id="breadcrumb"></div>
+          <div class="grid cols-4 mt-16" id="levelStats"></div>
+          <div id="levelBody" class="card-body"></div>
+        </div>
       </section>
     </main>
   </div>
@@ -102,6 +118,191 @@
       }).catch((e) => C.toast(e.message, "error"));
     }
 
+    /* ==================================================================
+       社群层级浏览：大社群 → 子社群 → 成员
+       浏览状态保存在 nav 栈中（index 指向当前层），支持前进 / 后退 /
+       面包屑跳层；细分数据缓存在 subCache，与全局划分互不干扰。
+       ================================================================== */
+    const nav = { stack: [{ level: 0 }], index: 0 };
+    let treeCache = null;        // 第 1 层：全局社群树
+    const subCache = {};         // 第 2 层：community id -> 细分结果
+
+    function crumbLabel(v) {
+      if (v.level === 0) return "全部社群";
+      if (v.level === 1) return "社群 " + v.community;
+      return "子社群 " + v.sub;
+    }
+
+    function renderCrumbs() {
+      const el = document.getElementById("breadcrumb");
+      let html = "";
+      for (let i = 0; i <= nav.index; i++) {
+        if (i > 0) html += '<span class="faint">›</span>';
+        const cur = i === nav.index;
+        html += '<button class="btn btn-ghost btn-sm" data-crumb="' + i + '"' +
+                (cur ? ' disabled style="font-weight:700;color:var(--text)"' : "") +
+                ">" + crumbLabel(nav.stack[i]) + "</button>";
+      }
+      el.innerHTML = html;
+      el.querySelectorAll("[data-crumb]").forEach((b) =>
+        b.addEventListener("click", () => navJump(+b.dataset.crumb)));
+    }
+
+    function levelTiles(tiles) {
+      document.getElementById("levelStats").innerHTML = tiles.map((t) =>
+        '<div class="card stat-tile"><div class="label">' + t.label + '</div><div class="value">' +
+        t.value + '</div><div class="hint">' + t.hint + "</div></div>"
+      ).join("");
+    }
+
+    function navGo(view) {
+      nav.stack.length = nav.index + 1;   // 截断“前进”分支，保持一致
+      nav.stack.push(view);
+      nav.index++;
+      renderLevel();
+    }
+    function navJump(i) { nav.index = i; renderLevel(); }
+
+    function renderLevel() {
+      document.getElementById("btnBack").disabled = nav.index <= 0;
+      document.getElementById("btnFwd").disabled = nav.index >= nav.stack.length - 1;
+      renderCrumbs();
+      const v = nav.stack[nav.index];
+      if (v.level === 0) renderRoot();
+      else if (v.level === 1) renderCommunity(v.community);
+      else renderSubMembers(v.community, v.sub);
+    }
+
+    function resetNav() {
+      nav.stack = [{ level: 0 }];
+      nav.index = 0;
+      treeCache = null;
+      for (const k in subCache) delete subCache[k];
+    }
+
+    // ---- 第 1 层：大社群 ------------------------------------------------
+    async function renderRoot() {
+      const body = document.getElementById("levelBody");
+      if (!treeCache) {
+        body.innerHTML = C.spinner();
+        try { treeCache = await api.communityTree(); }
+        catch (e) { body.innerHTML = C.emptyState("◈", e.message); return; }
+      }
+      const t = treeCache;
+      const kids = t.children || [];
+      levelTiles([
+        { label: "全局社群数", value: t.num_communities, hint: "第 1 层 · Louvain" },
+        { label: "全局模块度 Q", value: (t.modularity != null ? t.modularity.toFixed(4) : "—"), hint: "分辨率 " + (t.resolution || 1.0) },
+        { label: "已二级细分", value: t.subdivided_count + " / " + kids.length, hint: "含子社群的大社群" },
+        { label: "当前层级", value: "第 1 层", hint: "大社群" },
+      ]);
+      if (!kids.length) {
+        body.innerHTML = C.emptyState("◈", "暂无全局社群划分，请先点击上方「重新计算」");
+        return;
+      }
+      const max = Math.max.apply(null, kids.map((k) => k.size).concat([1]));
+      body.innerHTML = kids.map((k) =>
+        '<div class="bar-row">' +
+        '<span style="width:11px;height:11px;border-radius:3px;background:' + C.colorFor(k.id) + ';display:inline-block;flex:0 0 auto"></span>' +
+        '<span class="bar-label">社群 ' + k.id + "</span>" +
+        '<span class="bar-track"><span class="bar-fill" style="width:' + (k.size / max * 100).toFixed(1) + "%;background:" + C.colorFor(k.id) + '"></span></span>' +
+        '<span class="bar-val">' + k.size + " 人</span>" +
+        '<span class="badge info" title="对全局模块度的贡献">Q ' + k.modularity.toFixed(4) + "</span>" +
+        (k.subdivided ? '<span class="badge success">已细分 ' + k.num_subcommunities + " 个子社群</span>" : "") +
+        '<button class="btn btn-sm" data-enter="' + k.id + '">进入 ›</button>' +
+        '<button class="btn btn-sm btn-ghost" data-subdivide="' + k.id + '">' + (k.subdivided ? "重新细分" : "二级细分") + "</button>" +
+        "</div>"
+      ).join("");
+      body.querySelectorAll("[data-enter]").forEach((b) =>
+        b.addEventListener("click", () => navGo({ level: 1, community: +b.dataset.enter })));
+      body.querySelectorAll("[data-subdivide]").forEach((b) =>
+        b.addEventListener("click", () => runSubdivide(+b.dataset.subdivide)));
+    }
+
+    // ---- 第 2 层：子社群 ------------------------------------------------
+    async function renderCommunity(cid) {
+      const body = document.getElementById("levelBody");
+      let d = subCache[cid];
+      if (!d) {
+        body.innerHTML = C.spinner();
+        try { d = await api.subcommunity(cid); subCache[cid] = d; }
+        catch (e) { d = null; }
+      }
+      if (!d) {
+        // 尚未细分：展示大社群信息 + 细分入口
+        if (!treeCache) { try { treeCache = await api.communityTree(); } catch (_) { /* ignore */ } }
+        const meta = treeCache && (treeCache.children || []).find((k) => k.id === cid);
+        levelTiles([
+          { label: "所属大社群", value: "社群 " + cid, hint: "第 1 层" },
+          { label: "成员规模", value: meta ? meta.size + " 人" : "—", hint: "待细分" },
+          { label: "模块度贡献", value: meta ? meta.modularity.toFixed(4) : "—", hint: "对全局 Q 的贡献" },
+          { label: "当前层级", value: "第 2 层", hint: "子社群（未生成）" },
+        ]);
+        body.innerHTML = C.emptyState("◈", "社群 " + cid + " 尚未二级细分") +
+          '<div style="text-align:center;margin-top:-6px"><button class="btn btn-primary" id="btnRunSub">运行二级细分</button></div>';
+        document.getElementById("btnRunSub").addEventListener("click", () => runSubdivide(cid));
+        return;
+      }
+      const sizes = d.subcommunity_sizes || [];
+      levelTiles([
+        { label: "所属大社群", value: "社群 " + cid, hint: "第 1 层 · " + d.size + " 人" },
+        { label: "子社群数", value: d.num_subcommunities, hint: "第 2 层 · Louvain" },
+        { label: "子模块度 Q", value: d.modularity.toFixed(4), hint: "内部划分质量 · 分辨率 " + d.resolution },
+        { label: "耗时", value: d.time_ms != null ? d.time_ms.toFixed(1) + " ms" : "—", hint: "迭代 " + d.iterations + " 轮" },
+      ]);
+      if (!sizes.length) { body.innerHTML = C.emptyState("◈", "无子社群"); return; }
+      const max = Math.max.apply(null, sizes.map((s) => s.size).concat([1]));
+      body.innerHTML = sizes.map((s) =>
+        '<div class="bar-row">' +
+        '<span style="width:11px;height:11px;border-radius:3px;background:' + C.colorFor(s.sub) + ';display:inline-block;flex:0 0 auto"></span>' +
+        '<span class="bar-label">子社群 ' + s.sub + "</span>" +
+        '<span class="bar-track"><span class="bar-fill" style="width:' + (s.size / max * 100).toFixed(1) + "%;background:" + C.colorFor(s.sub) + '"></span></span>' +
+        '<span class="bar-val">' + s.size + " 人</span>" +
+        '<span class="badge info" title="子社群内部的模块度贡献">Q ' + s.modularity.toFixed(4) + "</span>" +
+        '<button class="btn btn-sm" data-members="' + s.sub + '">成员 ›</button>' +
+        "</div>"
+      ).join("");
+      body.querySelectorAll("[data-members]").forEach((b) =>
+        b.addEventListener("click", () => navGo({ level: 2, community: cid, sub: +b.dataset.members })));
+    }
+
+    // ---- 第 3 层：成员 --------------------------------------------------
+    async function renderSubMembers(cid, sid) {
+      const body = document.getElementById("levelBody");
+      let d = subCache[cid];
+      if (!d) {
+        body.innerHTML = C.spinner();
+        try { d = await api.subcommunity(cid); subCache[cid] = d; }
+        catch (e) { d = null; }
+      }
+      if (!d) { renderCommunity(cid); return; }   // 状态缺失时回退到上一层
+      const ids = (d.members && d.members[String(sid)]) || [];
+      levelTiles([
+        { label: "所属大社群", value: "社群 " + cid, hint: "第 1 层" },
+        { label: "所属子社群", value: "子社群 " + sid, hint: "第 2 层" },
+        { label: "成员数", value: ids.length + " 人", hint: "第 3 层 · 成员" },
+        { label: "子社群占比", value: d.size ? (ids.length / d.size * 100).toFixed(1) + "%" : "—", hint: "占社群 " + cid + " 的比例" },
+      ]);
+      const shown = ids.slice(0, 300);
+      body.innerHTML =
+        '<div class="row wrap">' +
+        shown.map((id) => '<span class="badge">' + id + "</span>").join(" ") +
+        (ids.length > 300 ? '<span class="badge faint">… 共 ' + ids.length + " 人</span>" : "") +
+        "</div>";
+    }
+
+    // ---- 触发二级细分 ---------------------------------------------------
+    async function runSubdivide(cid) {
+      const res = parseFloat(document.getElementById("subResolution").value) || 1.0;
+      try {
+        const d = await api.subdivideCommunity(cid, res);
+        subCache[cid] = d;
+        treeCache = null;   // 第 1 层统计（已细分数量等）需要刷新
+        C.toast("社群 " + cid + " 细分为 " + d.num_subcommunities + " 个子社群", "success");
+        renderLevel();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
     C.initPage("community", function () {
       document.getElementById("btnCompute").addEventListener("click", () => {
         const res = parseFloat(document.getElementById("resolution").value) || 1.0;
@@ -109,11 +310,19 @@
         btn.disabled = true; btn.textContent = "计算中…";
         api.computeCommunity(res).then((d) => {
           renderTiles(d); renderBars(d); renderMembers(d);
+          resetNav(); renderLevel();   // 全局重算后旧的二级细分已失效
           C.toast("社群划分完成：" + d.num_communities + " 个社群", "success");
         }).catch((e) => C.toast(e.message, "error"))
           .finally(() => { btn.disabled = false; btn.textContent = "重新计算"; });
       });
+      document.getElementById("btnBack").addEventListener("click", () => {
+        if (nav.index > 0) { nav.index--; renderLevel(); }
+      });
+      document.getElementById("btnFwd").addEventListener("click", () => {
+        if (nav.index < nav.stack.length - 1) { nav.index++; renderLevel(); }
+      });
       load();
+      renderLevel();
     });
   </script>
 </body>
